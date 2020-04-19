@@ -90,7 +90,7 @@ func main() {
 						query += " where " + strings.Join(where, " AND ")
 					}
 
-					rows, err := domainMgr.Query(query)
+					rows, err := domainMgr.Query(query, &todos.QueryOptions{})
 					if err != nil {
 						return err
 					}
@@ -124,6 +124,54 @@ func main() {
 					}
 
 					fmt.Println("create todo with id: ", id)
+
+					// no query consistency
+					query := "select meta().id as ID, todos.* from todos where meta().id = ?"
+					rows, err := domainMgr.Query(query, &todos.QueryOptions{}, id)
+					if err != nil {
+						return err
+					}
+
+					fmt.Println("check with not_bounded consistency level")
+					var found bool
+					for rows.Next() {
+						var t todos.Todo
+						if err := rows.Row(&t); err != nil {
+							return err
+						}
+						found = true
+						fmt.Printf("%+v\n", t)
+					}
+
+					if !found {
+						fmt.Println("new item not found with not_bounded consistency level")
+					}
+
+					// with at_plus on
+					// example for tracking mutation state
+					query = "select meta().id as ID, todos.* from todos where meta().id = ?"
+					rows, err = domainMgr.Query(query, &todos.QueryOptions{
+						AtPlus:      true,
+						Collections: []string{"todos"},
+					}, []interface{}{id}...)
+					if err != nil {
+						return fmt.Errorf("todo after add query error: %w", err)
+					}
+
+					found = false
+					for rows.Next() {
+						var t todos.Todo
+						if err := rows.Row(&t); err != nil {
+							return err
+						}
+						found = true
+						fmt.Printf("%+v\n", t)
+					}
+
+					if !found {
+						log.Fatal("new item not found with at_plus mode")
+					}
+
 					return nil
 				},
 			},
@@ -155,6 +203,7 @@ func main() {
 					}
 
 					fmt.Println("todo updated")
+
 					return nil
 				},
 			},

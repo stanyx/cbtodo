@@ -13,17 +13,152 @@ import (
 	"github.com/google/uuid"
 )
 
-type Domain struct {
-	cluster *gocb.Cluster
-	bucket  *gocb.Bucket
+type token struct {
+	createdTime time.Time
+	token       *gocb.MutationToken
 }
 
-func (d *Domain) Query(query string) (*gocb.QueryResult, error) {
-	return d.cluster.Query(query, &gocb.QueryOptions{})
+type MutationTokenStorage struct {
+	sync.RWMutex
+	clearTicker *time.Ticker
+	stopCh      chan chan struct{}
+	storage     map[string][]*token
+}
+
+func NewMutationTokenStorage() *MutationTokenStorage {
+	s := &MutationTokenStorage{
+		clearTicker: time.NewTicker(time.Second * 60),
+		storage:     make(map[string][]*token),
+	}
+
+	go func() {
+		for {
+			select {
+			case <-s.clearTicker.C:
+				s.ClearExpired()
+			case ch := <-s.stopCh:
+				s.clearTicker.Stop()
+				close(ch)
+			}
+		}
+	}()
+
+	return s
+}
+
+func (s *MutationTokenStorage) Add(entityType string, t *gocb.MutationToken) {
+	s.Lock()
+	defer s.Unlock()
+	s.storage[entityType] = append(s.storage[entityType], &token{
+		token:       t,
+		createdTime: time.Now(),
+	})
+}
+
+func (s *MutationTokenStorage) Get(entityType string) []*token {
+	s.RLock()
+	defer s.RUnlock()
+	return s.storage[entityType]
+}
+
+func (s *MutationTokenStorage) ClearExpired() {
+	s.Lock()
+	defer s.Unlock()
+	for k, v := range s.storage {
+		var tokens []*token
+		for _, tk := range v {
+			if !time.Now().After(tk.createdTime.Add(time.Hour)) {
+				tokens = append(tokens, tk)
+			}
+		}
+		s.storage[k] = tokens
+	}
+}
+
+func (s *MutationTokenStorage) Close() {
+	ch := make(chan struct{})
+	s.stopCh <- ch
+}
+
+type collection struct {
+	entityType   string
+	c            *gocb.Collection
+	tokenStorage *MutationTokenStorage
+}
+
+func (c *collection) Get(id string, opts *gocb.GetOptions) (*gocb.GetResult, error) {
+	return c.c.Get(id, opts)
+}
+
+func (c *collection) Insert(id string, value interface{}, opts *gocb.InsertOptions) (*gocb.MutationResult, error) {
+	res, err := c.c.Insert(id, value, opts)
+	if c.tokenStorage != nil && err == nil {
+		c.tokenStorage.Add(c.entityType, res.MutationToken())
+	}
+	return res, err
+}
+
+func (c *collection) Replace(id string, value interface{}, opts *gocb.ReplaceOptions) (*gocb.MutationResult, error) {
+	res, err := c.c.Replace(id, value, opts)
+	if c.tokenStorage != nil && err == nil {
+		c.tokenStorage.Add(c.entityType, res.MutationToken())
+	}
+	return res, err
+}
+
+func (c *collection) Remove(id string, opts *gocb.RemoveOptions) (*gocb.MutationResult, error) {
+	res, err := c.c.Remove(id, opts)
+	if c.tokenStorage != nil && err == nil {
+		c.tokenStorage.Add(c.entityType, res.MutationToken())
+	}
+	return res, err
+}
+
+type Domain struct {
+	cluster      *gocb.Cluster
+	bucket       *gocb.Bucket
+	tokenStorage *MutationTokenStorage
+}
+
+type QueryOptions struct {
+	AtPlus          bool
+	ScanConsistency gocb.QueryScanConsistency
+	Collections     []string
+}
+
+func (d *Domain) Query(query string, opts *QueryOptions, params ...interface{}) (*gocb.QueryResult, error) {
+	var queryOpts gocb.QueryOptions
+	if opts.AtPlus {
+		var tks []gocb.MutationToken
+		for _, collection := range opts.Collections {
+			for _, t := range d.tokenStorage.Get(collection) {
+				tks = append(tks, *t.token)
+			}
+		}
+		queryOpts.ConsistentWith = gocb.NewMutationState(tks...)
+	}
+	for _, p := range params {
+		queryOpts.PositionalParameters = append(queryOpts.PositionalParameters, p)
+	}
+	if opts.ScanConsistency > 0 {
+		queryOpts.ScanConsistency = opts.ScanConsistency
+	}
+	return d.cluster.Query(query, &queryOpts)
+}
+
+func (d *Domain) col(entityType string) *collection {
+	if entityType == "" {
+		entityType = d.bucket.Name()
+	}
+	return &collection{
+		entityType:   entityType,
+		tokenStorage: d.tokenStorage,
+		c:            d.bucket.DefaultCollection(),
+	}
 }
 
 func (d *Domain) Get(id string, data interface{}) (gocb.Cas, error) {
-	res, err := d.bucket.DefaultCollection().Get(id, &gocb.GetOptions{})
+	res, err := d.col("").Get(id, &gocb.GetOptions{})
 	if err != nil {
 		return 0, err
 	}
@@ -39,7 +174,7 @@ func (d *Domain) Create(data interface{}) (string, error) {
 	if f, ok := s.FieldOk("ID"); ok {
 		f.Set(id)
 	}
-	_, err := d.bucket.DefaultCollection().Insert(id, data, &gocb.InsertOptions{})
+	_, err := d.col("").Insert(id, data, &gocb.InsertOptions{})
 	return id, err
 }
 
@@ -48,10 +183,9 @@ func (d *Domain) Update(id string, cas gocb.Cas, data interface{}) (gocb.Cas, er
 	if f, ok := s.FieldOk("ID"); ok {
 		f.Set(id)
 	}
-	mr, err := d.bucket.DefaultCollection().Replace(id, data, &gocb.ReplaceOptions{
+	mr, err := d.col("").Replace(id, data, &gocb.ReplaceOptions{
 		Cas: cas,
 	})
-
 	if err != nil {
 		return 0, nil
 	}
@@ -59,7 +193,7 @@ func (d *Domain) Update(id string, cas gocb.Cas, data interface{}) (gocb.Cas, er
 }
 
 func (d *Domain) Delete(id string, cas gocb.Cas) (gocb.Cas, error) {
-	mr, err := d.bucket.DefaultCollection().Remove(id, &gocb.RemoveOptions{
+	mr, err := d.col("").Remove(id, &gocb.RemoveOptions{
 		Cas: cas,
 	})
 	if err != nil {
@@ -70,7 +204,8 @@ func (d *Domain) Delete(id string, cas gocb.Cas) (gocb.Cas, error) {
 
 type DB struct {
 	sync.RWMutex
-	domains map[string]*Domain
+	tokenStorage *MutationTokenStorage
+	domains      map[string]*Domain
 }
 
 type AddDomainOptions struct {
@@ -105,7 +240,10 @@ func init() {
 
 }
 
-var std *DB = &DB{domains: make(map[string]*Domain)}
+var std *DB = &DB{
+	tokenStorage: NewMutationTokenStorage(),
+	domains:      make(map[string]*Domain),
+}
 
 func (db *DB) GetDomain(name string) (*Domain, error) {
 	db.RLock()
@@ -156,8 +294,9 @@ func (db *DB) AddDomain(opts *AddDomainOptions) error {
 	}
 
 	db.domains[opts.Name] = &Domain{
-		cluster: cluster,
-		bucket:  bucket,
+		cluster:      cluster,
+		bucket:       bucket,
+		tokenStorage: NewMutationTokenStorage(),
 	}
 
 	return nil
